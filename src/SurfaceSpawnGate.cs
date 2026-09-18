@@ -1,3 +1,5 @@
+using System;
+using System.Diagnostics;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -78,6 +80,17 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         private static SystemTemporalStability stormSystem;
         private static RoomRegistry roomRegistry;
 
+        // Accumulated between ReportAmbientPerformance calls - see that
+        // method and LogAllAmbientCheckPerformance's comment in Config.cs
+        // for why this exists (we can't read vanilla's own call schedule
+        // from source, so this measures it directly instead).
+        private static long ambientWindowCallCount = 0;
+        private static long ambientWindowElapsedTicks = 0;
+
+        // Fixed real-world reporting window for ambient performance - see the
+        // comment where this is passed to RegisterGameTickListener in Apply().
+        private const int AmbientPerformanceReportIntervalMs = 1000;
+
         public static void Apply(ICoreServerAPI sapi, Harmony harmony, SurfaceLoreSpawnsAndRiftsReduxConfig config)
         {
             SurfaceSpawnGate.sapi = sapi;
@@ -124,6 +137,18 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
                     (config.PreventSpawnsInsideRooms
                         ? "; sheltered spawns inside a small enclosed room are also denied regardless of light."
                         : "."));
+
+                if (config.LogAllAmbientCheckPerformance || config.LogSlowAmbientCheckPerformance)
+                {
+                    // Fixed at exactly 1 real-world second, deliberately NOT a config
+                    // field and NOT reusing RiftCreatureSpawnCheckIntervalSeconds (that
+                    // was tried and reverted 2026-09-18) - a real second is the natural
+                    // unit for "how much of this tick's/second's frame budget did the
+                    // ambient gate use," not an arbitrary tunable that needs keeping in
+                    // sync with anything else. See SlowAmbientCheckThresholdMilliseconds
+                    // in Config.cs for the reasoning this feeds into.
+                    sapi.Event.RegisterGameTickListener(ReportAmbientPerformance, AmbientPerformanceReportIntervalMs);
+                }
             }
             catch (System.Exception ex)
             {
@@ -132,6 +157,25 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         }
 
         private static void Postfix(EntityProperties type, Vec3d spawnPosition, ref bool __result)
+        {
+            bool trackPerformance = config.LogAllAmbientCheckPerformance || config.LogSlowAmbientCheckPerformance;
+            long startTicks = trackPerformance ? Stopwatch.GetTimestamp() : 0;
+
+            PostfixInner(type, spawnPosition, ref __result);
+
+            if (trackPerformance)
+            {
+                ambientWindowCallCount++;
+                ambientWindowElapsedTicks += Stopwatch.GetTimestamp() - startTicks;
+            }
+        }
+
+        /// <summary>
+        /// The actual gate logic - split out from Postfix purely so the
+        /// performance-timing wrapper above can time the whole thing
+        /// (including every early return below) without duplicating it.
+        /// </summary>
+        private static void PostfixInner(EntityProperties type, Vec3d spawnPosition, ref bool __result)
         {
             if (!__result) return; // already denied by vanilla/another mod - nothing to add
             if (type?.Code == null) return;
@@ -163,6 +207,31 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
                 ? "storm active but AlsoPreventSpawnsDuringTemporalStorms=true"
                 : "exposed to sky, no storm active");
             __result = false;
+        }
+
+        /// <summary>
+        /// Flushes the call-count/elapsed-time totals accumulated since
+        /// the last report and (maybe) logs them - see
+        /// LogAllAmbientCheckPerformance's comment in Config.cs for why
+        /// this exists: we can't read vanilla's own ambient-spawn-attempt
+        /// schedule from source, so this measures the real, observed call
+        /// rate into our own postfix directly instead of guessing at it.
+        /// </summary>
+        private static void ReportAmbientPerformance(float dt)
+        {
+            long callCount = ambientWindowCallCount;
+            double elapsedMs = ambientWindowElapsedTicks * 1000.0 / Stopwatch.Frequency;
+            ambientWindowCallCount = 0;
+            ambientWindowElapsedTicks = 0;
+
+            bool isSlow = elapsedMs >= config.SlowAmbientCheckThresholdMilliseconds;
+            if (!config.LogAllAmbientCheckPerformance && !(config.LogSlowAmbientCheckPerformance && isSlow)) return;
+
+            double avgMsPerCall = callCount > 0 ? elapsedMs / callCount : 0;
+            sapi.Logger.Notification($"[SurfaceLoreSpawnsAndRiftsRedux] [ambient-check-performance] " +
+                $"{callCount} call(s) in the last 1s, " +
+                $"{elapsedMs:0.00}ms total ({avgMsPerCall:0.###}ms/call)" +
+                (isSlow ? $" - SLOW (>= {config.SlowAmbientCheckThresholdMilliseconds}ms/second)" : ""));
         }
 
         private static bool IsRestricted(string code)

@@ -183,14 +183,14 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // daytime - these are meant to be active portals things are
         // actively coming through, and night should feel noticeably more
         // dangerous, not just marginally so. At a rift's full health
-        // (RiftCreatureSpawnCheckIntervalSeconds=2s), 0.10 daytime averages
-        // one spawn roughly every 20s; 0.20 nighttime roughly every 10s -
+        // (RiftCreatureSpawnCheckIntervalSeconds=2s), 0.05 daytime averages
+        // one spawn roughly every 40s; 0.10 nighttime roughly every 20s -
         // both roughly double once RiftWeaknessMaxReduction kicks in near a
         // rift's death. If you change RiftCreatureSpawnCheckIntervalSeconds
         // again, rescale both of these the same way to keep the baseline
         // (outside a rift's territory, see below) rate where you want it.
-        public double RiftCreatureDaytimeSpawnChancePerCheck = 0.10;
-        public double RiftCreatureNighttimeSpawnChancePerCheck = 0.20;
+        public double RiftCreatureDaytimeSpawnChancePerCheck = 0.05;
+        public double RiftCreatureNighttimeSpawnChancePerCheck = 0.10;
 
         // -- A rift's territory: it senses and reacts to a nearby player --
         //
@@ -219,30 +219,36 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // let it feed you"). Both directions are the same mechanism, just a
         // modifier on either side of 1.0.
         //
-        // How a weakened rift changes this: a rift that's losing the fight
-        // doesn't get passive, it escalates. Both modifiers below are
-        // amplified based on GetWeaknessFactor (RiftKillTracker) using:
+        // How a weakened rift changes this: as a rift weakens, each modifier
+        // is linearly interpolated from its configured value (at full
+        // health) toward an amplified TARGET (at the weakness floor set by
+        // RiftWeaknessMaxReduction) - a straight line, no exponents. The
+        // target is computed once, from the floor, the same way you'd
+        // naturally expect: a boost (> 1.0) divides by the floor, a
+        // suppression (< 1.0) multiplies by it. E.g. the default inner
+        // modifier of 10.0, with the default 0.5 weakness floor, has a
+        // target of 10.0 / 0.5 = 20.0 - so as a rift goes from full health
+        // to fully weakened, the inner modifier climbs in a straight line
+        // from 10.0 up to 20.0. A suppression modifier of 0.2 would have a
+        // target of 0.2 * 0.5 = 0.1, sliding DOWN in a straight line from
+        // 0.2 to 0.1 instead - same rule, just running in whichever
+        // direction the modifier already points.
         //
-        //     effectiveModifier = configuredModifier ^ sqrt(1 / weakness)
-        //
-        // At full health (weakness = 1.0) the exponent is exactly 1, so the
-        // modifier applies exactly as configured. As the rift weakens, the
-        // exponent grows above 1, which pushes the modifier further from
-        // 1.0 in whichever direction it already points - a boost gets
-        // bigger, a suppression gets smaller - rather than fading out. At
-        // the DEFAULT weakness floor (weakness = 0.5, from
-        // RiftWeaknessMaxReduction's default of 0.5), the exponent works
-        // out to sqrt(2) =~ 1.414, so the default modifiers below (2.0
-        // outer / 5.0 inner) become roughly 2.67x / 9.74x once a rift is
-        // fully weakened. This composes with (not instead of) the day/night
-        // baseline already being reduced by weakness everywhere - see
-        // RiftWeaknessMaxReduction's comment - so a weakened rift is
-        // quieter overall, but fights harder than ever the moment you
-        // actually stand in its territory. The final chance (baseline x
-        // weakness x territory modifier) is always clamped to [0, 1]
-        // regardless of how extreme these numbers get.
-        public double RiftOuterTerritoryRadius = 10.0;
-        public double RiftOuterTerritoryCreatureSpawnChanceModifier = 2.0;
+        // While a player is inside either ring, this interpolated modifier
+        // REPLACES the ordinary weakness reduction entirely rather than
+        // composing with it - the territory system fully owns how weakness
+        // affects danger up close, so the two effects can't fight each
+        // other or cancel out. Outside both rings, the ordinary weakness
+        // reduction (see RiftWeaknessMaxReduction) still applies as normal.
+        // Worked example at the defaults (5% daytime baseline, 10.0 inner
+        // modifier, 0.5 weakness floor), standing in the inner ring: full
+        // health gives 5% x 10.0 = 50%; halfway to fully weakened gives 5%
+        // x 15.0 = 75%; fully weakened gives 5% x 20.0 = 100% (clamped) - a
+        // straight line the whole way, and "halfway" here means the exact
+        // same fraction of progress GetWeaknessFactor's own kill count
+        // uses, so the two stay in lockstep.
+        public double RiftOuterTerritoryRadius = 15.0;
+        public double RiftOuterTerritoryCreatureSpawnChanceModifier = 4.0;
 
         // The inner ring - checked before the outer one, so it should
         // normally be the SMALLER of the two radii (the defended core
@@ -250,8 +256,8 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // RiftOuterTerritoryRadius instead, the outer ring simply never
         // triggers, since anything within it is already within the inner
         // one.
-        public double RiftInnerTerritoryRadius = 3.0;
-        public double RiftInnerTerritoryCreatureSpawnChanceModifier = 5.0;
+        public double RiftInnerTerritoryRadius = 5.0;
+        public double RiftInnerTerritoryCreatureSpawnChanceModifier = 10.0;
 
         // Skip a rift's roll entirely once this many of ITS OWN spawns (see
         // RiftSurfaceSpawner.OwningRiftIdAttribute) already exist within
@@ -347,8 +353,19 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
 
         // How many of a rift's own spawns need to die by a player's hand
         // before that rift closes - only checked while EnableRiftClosing is
-        // true.
-        public int KillsToCloseRift = 10;
+        // true. Combined with KillsToCloseRiftVariance below, each rift
+        // rolls its own personal threshold once (the moment it's first
+        // damaged) rather than every rift needing exactly the same count -
+        // some rifts close a little easier, some put up more of a fight.
+        public int KillsToCloseRift = 8;
+
+        // The +/- range each rift's own close threshold is randomized
+        // within, around KillsToCloseRift - e.g. the default 8 +/- 2 means
+        // a given rift's actual threshold is a whole number uniformly
+        // chosen from 6 to 10, rolled once and then fixed for that rift's
+        // whole lifetime (not re-rolled every check). Set to 0 for every
+        // rift to use exactly KillsToCloseRift with no variation.
+        public int KillsToCloseRiftVariance = 2;
 
         // When EnableRiftClosing closes a rift, its despawn timer
         // (DieAtTotalHours) is set to now plus a fresh duration averaging
@@ -364,11 +381,11 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // almost none. These two settings give you that directly: how many
         // calendar hours (on average) an area stays rift-free after a
         // close, full stop, regardless of what the closed rift's own clock
-        // said. 2.0 is a reasonable starting point - raise it for a longer
+        // said. 3.0 is a reasonable starting point - raise it for a longer
         // guaranteed respite, lower it (or set to something small like 0.1)
         // to make closing feel closer to "immediately eligible for a
         // replacement" again.
-        public double RiftCloseDespawnDelayInCalendarHours = 2.0;
+        public double RiftCloseDespawnDelayInCalendarHours = 3.0;
 
         // The +/- range CloseRift randomizes around
         // RiftCloseDespawnDelayInCalendarHours - e.g. an average of
@@ -393,12 +410,19 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // for its weakness to bottom out at RiftWeaknessMaxReduction - only
         // used while EnableRiftWeakening is true, and completely
         // independent of KillsToCloseRift (a rift can, for example, be
-        // fully weakened after 10 kills but not close until 25, or close
-        // after 5 kills while never fading below 80% chance along the way).
-        // Defaulted equal to KillsToCloseRift's own default (10) purely
-        // because that was this mod's original, coupled behavior - change
-        // either one freely now that they're separate knobs.
-        public int KillsToFullyWeakenRift = 10;
+        // fully weakened after 4 kills but not close until 10, or close
+        // after 8 kills while never fading below 80% chance along the way).
+        // Combined with KillsToFullyWeakenRiftVariance below, each rift
+        // rolls its own personal threshold once, the same way
+        // KillsToCloseRift does.
+        public int KillsToFullyWeakenRift = 4;
+
+        // The +/- range each rift's own weaken-to-full threshold is
+        // randomized within, around KillsToFullyWeakenRift - same mechanic
+        // as KillsToCloseRiftVariance, just for weakening instead of
+        // closing. Default 4 +/- 1 means a whole number uniformly chosen
+        // from 3 to 5, rolled once per rift.
+        public int KillsToFullyWeakenRiftVariance = 1;
 
         // How much (as a fraction, 0 to 1) a rift's spawn chance is
         // reduced by, at most, as its kills approach KillsToFullyWeakenRift
@@ -427,9 +451,93 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         // cap or no-valid-position miss, and every tracked kill/weakening/
         // close (RiftSurfaceSpawner, RiftKillTracker). This is genuinely
         // noisy (a line every couple seconds per rift someone's near, on
-        // top of the ambient decisions) - defaulted to false now that
-        // active playtesting has settled down; turn it back on any time you
-        // need to dig through logs again.
+        // top of the ambient decisions, and once per vanilla ambient spawn
+        // attempt) - was defaulted to true for a 2026-09-18 performance-
+        // data-gathering pass, now back to false with real numbers in
+        // hand; turn it back on any time you need to dig through logs
+        // again.
         public bool LogSpawnChecks = false;
+
+        // Logs how long every single RiftSurfaceSpawner.OnCheck tick took
+        // (total rifts examined, how many were within range, how many
+        // attempted a spawn, elapsed milliseconds) - unconditionally,
+        // every RiftCreatureSpawnCheckIntervalSeconds, regardless of
+        // whether anything was actually slow. Noisy for the same reason
+        // LogSpawnChecks is (a line every couple seconds for as long as
+        // the server runs) - off by default; turn it on temporarily if
+        // you want the real numbers behind a specific tick, not just
+        // whether it crossed the "slow" threshold below.
+        public bool LogAllRiftCheckPerformance = false;
+
+        // Logs the same performance line as LogAllRiftCheckPerformance,
+        // but ONLY when a tick took at least
+        // SlowRiftCheckThresholdMilliseconds - silent the rest of the
+        // time, so there's no meaningful cost to leaving this on
+        // permanently (unlike the field above). Defaults to true for
+        // exactly that reason - it's a smoke detector, not a running
+        // log. If both this and LogAllRiftCheckPerformance are true,
+        // every tick still only gets logged once, not twice.
+        public bool LogSlowRiftCheckPerformance = true;
+
+        // The cutoff (in milliseconds) LogSlowRiftCheckPerformance uses
+        // to decide a tick was "slow" enough to log. Originally derived
+        // from a real solo playtest log's p95 tick time (~2.6ms) scaled
+        // to ~20 concurrent players, landing on 50 - then deliberately
+        // doubled to 100 (2026-09-18) once the reasoning shifted to
+        // "how much of a ~1000ms/sec frame budget did this one tick eat
+        // by itself," which is what actually matters for a smoke
+        // detector: this whole 100ms lands on the single server tick
+        // that ran RiftSurfaceSpawner.OnCheck, so it's a meaningful bite
+        // out of that tick's budget on its own, not just a busy-rift
+        // reading. See SlowAmbientCheckThresholdMilliseconds - both are
+        // now set to the same number under this same "is this a
+        // significant chunk of a second's worth of frame budget"
+        // reasoning, even though what they each measure is different
+        // (see that field's comment).
+        public double SlowRiftCheckThresholdMilliseconds = 100.0;
+
+        // Reports how many times VANILLA itself called into this mod's
+        // ambient spawn gate (SurfaceSpawnGate.Postfix) and how much
+        // cumulative time was spent inside it, totaled over a fixed
+        // real-world 1-second window (hardcoded in SurfaceSpawnGate, not
+        // a config field - see the comment on the tick listener
+        // registration in SurfaceSpawnGate.Apply for why) -
+        // unconditionally, every second, regardless of whether it was
+        // slow. Unlike the rift side, this mod doesn't control how often
+        // vanilla's own ambient spawner calls CanSpawnNearby - that
+        // scheduling lives in the core game, not in any source available
+        // to read - so this measures the real, observed call rate
+        // directly instead of guessing at it. Noisy for the same reason
+        // the other "LogAll" toggles are - was defaulted to true for the
+        // 2026-09-18 data-gathering pass, now back to false with real
+        // numbers in hand.
+        public bool LogAllAmbientCheckPerformance = false;
+
+        // Logs the same summary as LogAllAmbientCheckPerformance, but
+        // ONLY when a window's cumulative time crossed
+        // SlowAmbientCheckThresholdMilliseconds - silent otherwise, so
+        // (like its rift-side counterpart) there's no real cost to
+        // leaving this on permanently. Defaults to true for the same
+        // reason.
+        public bool LogSlowAmbientCheckPerformance = true;
+
+        // The cutoff (in milliseconds, summed across every
+        // SurfaceSpawnGate.Postfix call within one real-world second)
+        // that decides a window was "slow" enough for
+        // LogSlowAmbientCheckPerformance to log it. Set to 100.0
+        // (2026-09-18), the same number as SlowRiftCheckThresholdMilliseconds,
+        // under the same reasoning: a server has roughly 1000ms of frame
+        // budget per real second, so 100ms of cumulative time in this
+        // mod's ambient gate during that same second is a meaningful
+        // slice of that budget, regardless of how many individual calls
+        // it was spread across. Important nuance: this is a SUM across
+        // many small calls landing on many different ticks within that
+        // second, whereas the rift threshold above is ONE call's time
+        // landing entirely on ONE tick - the same 100ms is therefore
+        // less likely to visibly stall any single tick on this side than
+        // on the rift side, even though the number matches. Matching the
+        // numbers makes the two readings comparable at a glance; it does
+        // not claim they carry equal risk.
+        public double SlowAmbientCheckThresholdMilliseconds = 100.0;
     }
 }

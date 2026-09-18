@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -74,11 +75,15 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
     ///
     /// The other direction a rift's danger can move: RiftKillTracker
     /// weakens (and eventually closes) a specific rift as its own tagged
-    /// spawns are killed by a player, via GetWeaknessFactor multiplying
-    /// straight into the baseline chance AND amplifying the territory
-    /// modifiers above (see GetTerritoryModifier). See RiftKillTracker for
-    /// the mechanics - this class only asks it "how weak is this rift right
-    /// now" and otherwise doesn't know it exists.
+    /// spawns are killed by a player. Outside both territory rings,
+    /// GetWeaknessFactor's result directly reduces the baseline chance as
+    /// you'd expect; inside either ring, weakness instead linearly
+    /// amplifies that ring's own modifier (see GetTerritoryModifier) and
+    /// the plain baseline reduction is skipped entirely - the two effects
+    /// never compose, so one can never accidentally cancel the other out.
+    /// See RiftKillTracker for the kill-tracking mechanics - this class
+    /// only asks it "how weak is this rift right now" and otherwise
+    /// doesn't know it exists.
     /// </summary>
     public class RiftSurfaceSpawner
     {
@@ -140,17 +145,17 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
             string killTrackingMsg;
             if (config.EnableRiftWeakening && config.EnableRiftClosing)
             {
-                killTrackingMsg = $"weakening + closing enabled - {config.KillsToFullyWeakenRift} kills fully " +
-                    $"weakens, {config.KillsToCloseRift} kills closes a rift.";
+                killTrackingMsg = $"weakening + closing enabled - {config.KillsToFullyWeakenRift}±{config.KillsToFullyWeakenRiftVariance} kills fully " +
+                    $"weakens, {config.KillsToCloseRift}±{config.KillsToCloseRiftVariance} kills closes a rift (rolled per rift).";
             }
             else if (config.EnableRiftWeakening)
             {
-                killTrackingMsg = $"weakening enabled ({config.KillsToFullyWeakenRift} kills fully weakens), " +
+                killTrackingMsg = $"weakening enabled ({config.KillsToFullyWeakenRift}±{config.KillsToFullyWeakenRiftVariance} kills fully weakens, rolled per rift), " +
                     "closing disabled - rifts never close from kills.";
             }
             else if (config.EnableRiftClosing)
             {
-                killTrackingMsg = $"closing enabled ({config.KillsToCloseRift} kills closes a rift), weakening " +
+                killTrackingMsg = $"closing enabled ({config.KillsToCloseRift}±{config.KillsToCloseRiftVariance} kills closes a rift, rolled per rift), weakening " +
                     "disabled - full chance right up until closed.";
             }
             else
@@ -304,6 +309,11 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
 
         private void OnCheck(float dt)
         {
+            bool trackPerformance = config.LogAllRiftCheckPerformance || config.LogSlowRiftCheckPerformance;
+            Stopwatch stopwatch = trackPerformance ? Stopwatch.StartNew() : null;
+            int inRangeCount = 0;
+            int spawnAttemptCount = 0;
+
             var rifts = riftSystem.ServerRifts;
             for (int i = 0; i < rifts.Count; i++)
             {
@@ -317,16 +327,25 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
                 // Cheapest check first: skip rifts nobody is actually near
                 // before doing any of the day/night rolls or placement work.
                 // Reused below for the territory modifier, so this is a
-                // distance, not just a bool.
-                double nearestPlayerDist = NearestPlayerDistance(rift.Position);
+                // distance, not just a bool. Bounded to the max range up
+                // front (see NearestPlayerDistance) so this scales with how
+                // many players are actually near THIS rift, not with the
+                // server's total online player count.
+                double nearestPlayerDist = NearestPlayerDistance(rift.Position, config.RiftCreatureSpawnMaxDistanceFromPlayer);
                 if (nearestPlayerDist > config.RiftCreatureSpawnMaxDistanceFromPlayer) continue;
+                inRangeCount++;
 
                 double daylightFraction = GetDaylightFraction(rift.Position);
                 double baseChance = Lerp(config.RiftCreatureNighttimeSpawnChancePerCheck, config.RiftCreatureDaytimeSpawnChancePerCheck, daylightFraction);
                 double weakness = killTracker?.GetWeaknessFactor(rift.RiftId) ?? 1.0;
-                double weakenedBaseChance = baseChance * weakness;
-                double territoryModifier = GetTerritoryModifier(nearestPlayerDist, weakness, out string zoneName);
-                double chance = GameMath.Clamp((float)(weakenedBaseChance * territoryModifier), 0f, 1f);
+                double territoryModifier = GetTerritoryModifier(nearestPlayerDist, weakness, out string zoneName, out bool inZone);
+                // Inside a territory ring, the ring's own (weakness-
+                // amplified) modifier is the full multiplier - weakness
+                // already went into computing it. Outside both rings,
+                // weakness applies directly to the baseline as normal. The
+                // two never compose - see the class comment for why.
+                double appliedMultiplier = inZone ? territoryModifier : weakness;
+                double chance = GameMath.Clamp((float)(baseChance * appliedMultiplier), 0f, 1f);
 
                 double roll = rand.NextDouble();
                 bool passed = roll <= chance;
@@ -335,16 +354,32 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
                 {
                     sapi.Logger.Notification($"[SurfaceLoreSpawnsAndRiftsRedux] [rift-check] rift={rift.RiftId} " +
                         $"playerDist={nearestPlayerDist:0.#} daylight={daylightFraction:0.00} " +
-                        $"base={baseChance:P2} weakness={weakness:P0} weakenedBase={weakenedBaseChance:P2} " +
-                        $"zone={zoneName} territoryModifier={territoryModifier:0.00}x " +
+                        $"base={baseChance:P2} weakness={weakness:P0} zone={zoneName} " +
+                        $"appliedMultiplier={appliedMultiplier:0.00}x " +
                         $"final={chance:P2} roll={roll:P2} -> {(passed ? "PASS" : "FAIL")}");
                 }
 
                 if (!passed) continue;
+                spawnAttemptCount++;
 
                 int max = (int)Math.Round(Lerp(config.MaxSpawnsPerRiftNighttime,
                     config.MaxSpawnsPerRiftDaytime, daylightFraction));
                 TrySpawnNear(rift, max);
+            }
+
+            if (trackPerformance)
+            {
+                stopwatch.Stop();
+                double elapsedMs = stopwatch.Elapsed.TotalMilliseconds;
+                bool isSlow = elapsedMs >= config.SlowRiftCheckThresholdMilliseconds;
+
+                if (config.LogAllRiftCheckPerformance || (config.LogSlowRiftCheckPerformance && isSlow))
+                {
+                    sapi.Logger.Notification($"[SurfaceLoreSpawnsAndRiftsRedux] [rift-check-performance] " +
+                        $"{rifts.Count} total rift(s), {inRangeCount} within range, {spawnAttemptCount} spawn attempt(s), " +
+                        $"{elapsedMs:0.00}ms" +
+                        (isSlow ? $" - SLOW (>= {config.SlowRiftCheckThresholdMilliseconds}ms)" : ""));
+                }
             }
         }
 
@@ -366,26 +401,23 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         /// <summary>
         /// Picks which of a rift's two territory rings the nearest player is
         /// standing in (inner checked first, since it should be the smaller
-        /// of the two - see RiftInnerTerritoryRadius's comment), returns
-        /// that ring's configured modifier amplified by how weakened the
-        /// rift is, and reports which ring via <paramref name="zoneName"/>
-        /// for logging. Returns 1.0 (unchanged) if the player is outside
-        /// both rings, or if RiftOuterTerritoryRadius is zero/negative
-        /// (the whole territory system disabled).
-        ///
-        /// Amplification: effectiveModifier = configuredModifier ^
-        /// sqrt(1 / weakness) - see the long comment on
+        /// of the two - see RiftInnerTerritoryRadius's comment), and returns
+        /// that ring's modifier linearly interpolated toward its weakness-
+        /// amplified target - see the long comment on
         /// RiftOuterTerritoryRadius in Config.cs for the full reasoning and
-        /// worked numbers. weakness is floored just above zero before
-        /// dividing so a fully-silenced rift (weakness = 0, only reachable
-        /// if RiftWeaknessMaxReduction is pushed to 1.0) can't produce an
-        /// infinite exponent.
+        /// worked numbers. Reports which ring (or "none"/"disabled") via
+        /// <paramref name="zoneName"/> for logging, and whether a ring
+        /// applied at all via <paramref name="inZone"/> - when true, the
+        /// caller should use the returned value AS the full chance
+        /// multiplier instead of separately applying weakness, since the
+        /// interpolation already accounts for it.
         /// </summary>
-        private double GetTerritoryModifier(double nearestPlayerDist, double weakness, out string zoneName)
+        private double GetTerritoryModifier(double nearestPlayerDist, double weakness, out string zoneName, out bool inZone)
         {
             if (config.RiftOuterTerritoryRadius <= 0)
             {
                 zoneName = "disabled";
+                inZone = false;
                 return 1.0;
             }
 
@@ -403,12 +435,28 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
             else
             {
                 zoneName = "none";
+                inZone = false;
                 return 1.0;
             }
 
-            double safeWeakness = Math.Max(0.0001, weakness);
-            double amplification = Math.Sqrt(1.0 / safeWeakness);
-            return Math.Pow(rawModifier, amplification);
+            inZone = true;
+
+            // How far toward the weakness floor this rift currently is - 0
+            // at full health, 1 fully weakened. The same fraction
+            // GetWeaknessFactor itself is built from, so "halfway to fully
+            // weakened by kill count" and "halfway through this
+            // interpolation" always agree.
+            double floorWeakness = Math.Max(0.0001, 1.0 - config.RiftWeaknessMaxReduction);
+            double progress = floorWeakness >= 1.0
+                ? 0.0
+                : GameMath.Clamp((float)((1.0 - weakness) / (1.0 - floorWeakness)), 0f, 1f);
+
+            double targetModifier;
+            if (rawModifier > 1.0) targetModifier = rawModifier / floorWeakness;
+            else if (rawModifier < 1.0) targetModifier = rawModifier * floorWeakness;
+            else targetModifier = 1.0;
+
+            return Lerp(rawModifier, targetModifier, progress);
         }
 
         private static double Lerp(double atZero, double atOne, double t) => atZero + (atOne - atZero) * t;
@@ -477,21 +525,21 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         }
 
         /// <summary>
-        /// Distance to the closest online player, or double.MaxValue if
-        /// none are loaded/online - matches NearestRiftDistance's own
-        /// "nothing found" convention in vanilla's TemporalStability.cs.
+        /// Distance to the closest online player within maxRadius, or
+        /// double.MaxValue if none are that close - matches
+        /// NearestRiftDistance's own "nothing found" convention in
+        /// vanilla's TemporalStability.cs. Uses EntityPartitioning's
+        /// spatial grid (the same index CountRiftOwnedSpawns already
+        /// relies on) rather than a raw loop over every online player, so
+        /// the cost scales with how many players happen to be near THIS
+        /// position, not with the server's total player count - matters
+        /// once a server has many players spread across a large map, since
+        /// this runs for every active rift on every check.
         /// </summary>
-        private double NearestPlayerDistance(Vec3d pos)
+        private double NearestPlayerDistance(Vec3d pos, double maxRadius)
         {
-            double nearest = double.MaxValue;
-            foreach (var player in sapi.World.AllOnlinePlayers)
-            {
-                var entity = player?.Entity;
-                if (entity == null) continue;
-                double dist = entity.Pos.DistanceTo(pos);
-                if (dist < nearest) nearest = dist;
-            }
-            return nearest;
+            Entity nearest = entityPartitioning.GetNearestEntity(pos, maxRadius, e => e is EntityPlayer, EnumEntitySearchType.Creatures);
+            return nearest?.Pos.DistanceTo(pos) ?? double.MaxValue;
         }
 
         private bool IsValidPosition(Vec3d candidate, EntityProperties entityType)
@@ -513,19 +561,14 @@ namespace SurfaceLoreSpawnsAndRiftsRedux
         private bool IsTooCloseToAnyPlayer(Vec3d pos)
         {
             // <= 0 means "no exclusion" (same convention as
-            // RiftOuterTerritoryRadius) - skip the loop entirely rather than
-            // relying on SquareDistanceTo never being negative to make it
-            // a no-op.
+            // RiftOuterTerritoryRadius) - skip the search entirely rather
+            // than asking EntityPartitioning to do a zero/negative-radius
+            // lookup, and (at the default of 0.0) avoid a spatial query at
+            // all for every single placement candidate.
             if (config.RiftCreatureSpawnMinDistanceFromPlayer <= 0) return false;
 
-            double radiusSq = config.RiftCreatureSpawnMinDistanceFromPlayer * config.RiftCreatureSpawnMinDistanceFromPlayer;
-            foreach (var player in sapi.World.AllOnlinePlayers)
-            {
-                var entity = player?.Entity;
-                if (entity == null) continue;
-                if (entity.Pos.SquareDistanceTo(pos) < radiusSq) return true;
-            }
-            return false;
+            return entityPartitioning.GetNearestEntity(pos, config.RiftCreatureSpawnMinDistanceFromPlayer,
+                e => e is EntityPlayer, EnumEntitySearchType.Creatures) != null;
         }
 
         private void SpawnOneAt(EntityProperties entityType, Vec3d spawnPos, int owningRiftId)
